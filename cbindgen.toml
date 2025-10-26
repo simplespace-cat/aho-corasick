@@ -1,0 +1,28 @@
+# cbindgen.toml
+language = "C"
+pragma_once = true
+include_guard = "AHOCORASICK_CAPI_H"
+documentation = true
+usize_is_size_t = true
+sys_includes = ["stddef.h", "stdint.h", "stdbool.h"]
+
+[export]
+# Only export the C API items.
+include = ["ffi"]
+
+[defines]
+# You can set feature-dependent defines here if needed.
+# "std" = "AHOCORASICK_HAVE_STD"
+
+[macro_expansion]
+bitflags = true
+
+[style]
+# Prefer C-style enums in the header.
+enum_class = false
+
+[parse]
+expand = true
+clean = true
+
+[defines]
