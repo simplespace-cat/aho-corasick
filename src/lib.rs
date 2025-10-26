@@ -329,9 +329,6 @@ mod testoibits {
 #[cfg(feature = "std")]
 #[allow(missing_docs)]
 pub mod ffi {
-	use std::boxed::Box;
-    use std::string::ToString;
-    use std::vec::Vec;
     //! A small, refined C API for the Aho-Corasick library.
     //!
     //! Design goals:
@@ -343,8 +340,10 @@ pub mod ffi {
     //! Memory management:
     //! - All buffers returned by this API must be freed with the provided
     //!   free functions in this module (they use Rust's allocator).
+    use std::boxed::Box;
+    use std::string::ToString;
+    use std::vec::Vec;
 
-    use core::ptr::null_mut;
     use std::{
         ffi::c_char,
         panic::{catch_unwind, AssertUnwindSafe},
@@ -470,7 +469,7 @@ pub mod ffi {
         if patterns.is_null() || lens.is_null() {
             return Err(ACResult::AC_INVALID_ARGUMENT);
         }
-        let mut out = Vec::with_capacity(count);
+        let mut out: Vec<&'a [u8]> = Vec::with_capacity(count);
         for i in 0..count {
             let p = *patterns.add(i);
             let l = *lens.add(i);
@@ -510,7 +509,7 @@ pub mod ffi {
         if err_msg.is_null() {
             return;
         }
-        let mut bytes = msg.as_bytes().to_vec();
+        let bytes = msg.as_bytes().to_vec();
         let boxed: Box<[u8]> = bytes.into_boxed_slice();
         let len = (&*boxed).len();
         let ptr = Box::into_raw(boxed) as *mut c_char;
@@ -616,7 +615,10 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let b = unsafe { &mut *builder };
-            let pats = unsafe { read_patterns(patterns, pattern_lens, patterns_len)? };
+            let pats = match unsafe { read_patterns(patterns, pattern_lens, patterns_len) } {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
             match b.inner.build(pats) {
                 Ok(ac) => {
                     unsafe { *out_ac = Box::into_raw(Box::new(AC { inner: ac })) };
@@ -649,7 +651,10 @@ pub mod ffi {
             if out_ac.is_null() {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
-            let pats = unsafe { read_patterns(patterns, pattern_lens, patterns_len)? };
+            let pats = match unsafe { read_patterns(patterns, pattern_lens, patterns_len) } {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
             match AhoCorasick::new(pats) {
                 Ok(ac) => {
                     unsafe { *out_ac = Box::into_raw(Box::new(AC { inner: ac })) };
@@ -768,9 +773,12 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let ac = unsafe { &*ac };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
             // earliest(true) for is_match with leftmost semantics.
-            match ac.inner.try_find(&Input::new(hay).earliest(true)) {
+            match ac.inner.try_find(Input::new(hay).earliest(true)) {
                 Ok(opt) => {
                     unsafe { *out_found = opt.is_some() };
                     ACResult::AC_OK
@@ -807,7 +815,10 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let ac = unsafe { &*ac };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
             let input = Input::new(hay)
                 .earliest(earliest)
                 .anchored(if anchored { Anchored::Yes } else { Anchored::No });
@@ -850,7 +861,10 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let ac = unsafe { &*ac };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
             let input =
                 Input::new(hay).anchored(if anchored { Anchored::Yes } else { Anchored::No });
             match ac.inner.try_find_iter(input) {
@@ -903,7 +917,10 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let ac = unsafe { &*ac };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
             let input = Input::new(hay).anchored(Anchored::Yes).earliest(true);
             match ac.inner.try_find(input) {
                 Ok(opt) => {
@@ -935,7 +952,10 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let ac = unsafe { &*ac };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
             let input = Input::new(hay).anchored(Anchored::Yes);
             match ac.inner.try_find(input) {
                 Ok(opt) => {
@@ -1039,7 +1059,10 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let ac = unsafe { &*ac };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
             match find_suffix_match(&ac.inner, hay) {
                 Ok(opt) => {
                     unsafe { *out_found = opt.is_some() };
@@ -1077,7 +1100,10 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let ac = unsafe { &*ac };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
             match find_suffix_match(&ac.inner, hay) {
                 Ok(opt) => {
                     if let Some(m) = opt {
@@ -1153,7 +1179,10 @@ pub mod ffi {
             }
             let ac = unsafe { &*ac };
             let s = unsafe { &mut *state };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
             match ac.inner.try_find_overlapping(hay, &mut s.inner) {
                 Ok(()) => {
                     let opt = s.inner.get_match();
@@ -1202,8 +1231,14 @@ pub mod ffi {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
             let ac = unsafe { &*ac };
-            let hay = unsafe { read_slice(haystack, haystack_len)? };
-            let repls = unsafe { read_slices(replacements, repl_lens, replacements_len)? };
+            let hay = match unsafe { read_slice(haystack, haystack_len) } {
+                Ok(h) => h,
+                Err(code) => return code,
+            };
+            let repls = match unsafe { read_slices(replacements, repl_lens, replacements_len) } {
+                Ok(r) => r,
+                Err(code) => return code,
+            };
             if repls.len() != ac.inner.patterns_len() {
                 return ACResult::AC_INVALID_ARGUMENT;
             }
