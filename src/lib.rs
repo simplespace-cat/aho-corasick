@@ -1,3 +1,4 @@
+// lib.rs
 /*!
 A library for finding occurrences of many patterns at once. This library
 provides multiple pattern search principally through an implementation of the
@@ -322,5 +323,944 @@ mod testoibits {
         assert_all::<packed::Searcher>();
         assert_all::<packed::FindIter>();
         assert_all::<packed::MatchKind>();
+    }
+}
+
+#[cfg(feature = "std")]
+#[allow(missing_docs)]
+pub mod ffi {
+	use std::boxed::Box;
+    use std::string::ToString;
+    use std::vec::Vec;
+    //! A small, refined C API for the Aho-Corasick library.
+    //!
+    //! Design goals:
+    //! - Static library output (crate-type = "staticlib")
+    //! - A minimal but mature interface for common scenarios
+    //! - Automatic selection of the best underlying implementation (DFA/NFA)
+    //! - No panics unwind across the FFI boundary (errors are returned)
+    //!
+    //! Memory management:
+    //! - All buffers returned by this API must be freed with the provided
+    //!   free functions in this module (they use Rust's allocator).
+
+    use core::ptr::null_mut;
+    use std::{
+        ffi::c_char,
+        panic::{catch_unwind, AssertUnwindSafe},
+        slice,
+    };
+
+    use crate::{
+        automaton::OverlappingState, Anchored, AhoCorasick, AhoCorasickBuilder,
+        AhoCorasickKind, Input, Match, MatchError, MatchKind, StartKind,
+    };
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum ACResult {
+        AC_OK = 0,
+        AC_BUILD_ERROR = 1,
+        AC_MATCH_ERROR = 2,
+        AC_INVALID_ARGUMENT = 3,
+        AC_PANIC = 100,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum ACMatchKind {
+        Standard = 0,
+        LeftmostFirst = 1,
+        LeftmostLongest = 2,
+    }
+
+    impl From<ACMatchKind> for MatchKind {
+        fn from(v: ACMatchKind) -> Self {
+            match v {
+                ACMatchKind::Standard => MatchKind::Standard,
+                ACMatchKind::LeftmostFirst => MatchKind::LeftmostFirst,
+                ACMatchKind::LeftmostLongest => MatchKind::LeftmostLongest,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum ACStartKind {
+        Unanchored = 0,
+        Anchored = 1,
+        Both = 2,
+    }
+
+    impl From<ACStartKind> for StartKind {
+        fn from(v: ACStartKind) -> Self {
+            match v {
+                ACStartKind::Unanchored => StartKind::Unanchored,
+                ACStartKind::Anchored => StartKind::Anchored,
+                ACStartKind::Both => StartKind::Both,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum ACAutomatonKind {
+        NoncontiguousNFA = 0,
+        ContiguousNFA = 1,
+        DFA = 2,
+    }
+
+    impl From<AhoCorasickKind> for ACAutomatonKind {
+        fn from(k: AhoCorasickKind) -> Self {
+            match k {
+                AhoCorasickKind::NoncontiguousNFA => {
+                    ACAutomatonKind::NoncontiguousNFA
+                }
+                AhoCorasickKind::ContiguousNFA => ACAutomatonKind::ContiguousNFA,
+                AhoCorasickKind::DFA => ACAutomatonKind::DFA,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct ACMatch {
+        pub pattern: u32,
+        pub start: usize,
+        pub end: usize,
+    }
+
+    impl From<Match> for ACMatch {
+        fn from(m: Match) -> Self {
+            ACMatch {
+                pattern: m.pattern().as_usize() as u32,
+                start: m.start(),
+                end: m.end(),
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct AC {
+        inner: AhoCorasick,
+    }
+
+    #[repr(C)]
+    pub struct ACBuilder {
+        inner: AhoCorasickBuilder,
+    }
+
+    #[repr(C)]
+    pub struct ACOverlappingState {
+        inner: OverlappingState,
+    }
+
+    // ===================
+    // Utilities
+    // ===================
+
+    unsafe fn read_patterns<'a>(
+        patterns: *const *const u8,
+        lens: *const usize,
+        count: usize,
+    ) -> Result<Vec<&'a [u8]>, ACResult> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if patterns.is_null() || lens.is_null() {
+            return Err(ACResult::AC_INVALID_ARGUMENT);
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let p = *patterns.add(i);
+            let l = *lens.add(i);
+            if l == 0 {
+                out.push(&[]);
+            } else if p.is_null() {
+                return Err(ACResult::AC_INVALID_ARGUMENT);
+            } else {
+                out.push(slice::from_raw_parts(p, l));
+            }
+        }
+        Ok(out)
+    }
+
+    unsafe fn read_slices<'a>(
+        ptrs: *const *const u8,
+        lens: *const usize,
+        count: usize,
+    ) -> Result<Vec<&'a [u8]>, ACResult> {
+        read_patterns(ptrs, lens, count)
+    }
+
+    unsafe fn read_slice<'a>(
+        ptr: *const u8,
+        len: usize,
+    ) -> Result<&'a [u8], ACResult> {
+        if len == 0 {
+            Ok(&[])
+        } else if ptr.is_null() {
+            Err(ACResult::AC_INVALID_ARGUMENT)
+        } else {
+            Ok(slice::from_raw_parts(ptr, len))
+        }
+    }
+
+    unsafe fn set_error(err_msg: *mut *mut c_char, err_len: *mut usize, msg: &str) {
+        if err_msg.is_null() {
+            return;
+        }
+        let mut bytes = msg.as_bytes().to_vec();
+        let boxed: Box<[u8]> = bytes.into_boxed_slice();
+        let len = (&*boxed).len();
+        let ptr = Box::into_raw(boxed) as *mut c_char;
+        *err_msg = ptr;
+        if !err_len.is_null() {
+            *err_len = len;
+        }
+    }
+
+    fn map_build_err(
+        e: crate::util::error::BuildError,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        unsafe { set_error(err_msg, err_len, &e.to_string()) }
+        ACResult::AC_BUILD_ERROR
+    }
+
+    fn map_match_err(
+        e: MatchError,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        unsafe { set_error(err_msg, err_len, &e.to_string()) }
+        ACResult::AC_MATCH_ERROR
+    }
+
+    // ===================
+    // Builder
+    // ===================
+
+    /// Create a new builder with default configuration.
+    #[no_mangle]
+    pub extern "C" fn ac_builder_create() -> *mut ACBuilder {
+        let b = ACBuilder { inner: AhoCorasickBuilder::new() };
+        Box::into_raw(Box::new(b))
+    }
+
+    /// Free a builder previously returned by `ac_builder_create`.
+    #[no_mangle]
+    pub extern "C" fn ac_builder_free(builder: *mut ACBuilder) {
+        if !builder.is_null() {
+            unsafe { drop(Box::from_raw(builder)) };
+        }
+    }
+
+    /// Enable or disable ASCII-aware case-insensitivity.
+    #[no_mangle]
+    pub extern "C" fn ac_builder_set_ascii_case_insensitive(
+        builder: *mut ACBuilder,
+        yes: bool,
+    ) {
+        if builder.is_null() {
+            return;
+        }
+        let b = unsafe { &mut *builder };
+        b.inner.ascii_case_insensitive(yes);
+    }
+
+    /// Set the match semantics (standard/leftmost-first/leftmost-longest).
+    #[no_mangle]
+    pub extern "C" fn ac_builder_set_match_kind(
+        builder: *mut ACBuilder,
+        kind: ACMatchKind,
+    ) {
+        if builder.is_null() {
+            return;
+        }
+        let b = unsafe { &mut *builder };
+        b.inner.match_kind(kind.into());
+    }
+
+    /// Set the supported start kind (unanchored by default).
+    #[no_mangle]
+    pub extern "C" fn ac_builder_set_start_kind(
+        builder: *mut ACBuilder,
+        kind: ACStartKind,
+    ) {
+        if builder.is_null() {
+            return;
+        }
+        let b = unsafe { &mut *builder };
+        b.inner.start_kind(kind.into());
+    }
+
+    /// Build an automaton using the given builder and pattern set.
+    ///
+    /// On success, returns `AC_OK` and writes a non-null handle to `*out_ac`.
+    /// On failure, returns a non-zero error code and optionally writes an
+    /// error message buffer to `*err_msg`/`*err_len` (must be freed with `ac_str_free`).
+    #[no_mangle]
+    pub extern "C" fn ac_builder_build(
+        builder: *mut ACBuilder,
+        patterns: *const *const u8,
+        pattern_lens: *const usize,
+        patterns_len: usize,
+        out_ac: *mut *mut AC,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if builder.is_null() || out_ac.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let b = unsafe { &mut *builder };
+            let pats = unsafe { read_patterns(patterns, pattern_lens, patterns_len)? };
+            match b.inner.build(pats) {
+                Ok(ac) => {
+                    unsafe { *out_ac = Box::into_raw(Box::new(AC { inner: ac })) };
+                    ACResult::AC_OK
+                }
+                Err(e) => map_build_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(code) => code,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    // ===================
+    // Automaton: creation and info
+    // ===================
+
+    /// Convenience: build an automaton with default configuration.
+    #[no_mangle]
+    pub extern "C" fn ac_new(
+        patterns: *const *const u8,
+        pattern_lens: *const usize,
+        patterns_len: usize,
+        out_ac: *mut *mut AC,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if out_ac.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let pats = unsafe { read_patterns(patterns, pattern_lens, patterns_len)? };
+            match AhoCorasick::new(pats) {
+                Ok(ac) => {
+                    unsafe { *out_ac = Box::into_raw(Box::new(AC { inner: ac })) };
+                    ACResult::AC_OK
+                }
+                Err(e) => map_build_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(code) => code,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    /// Free an automaton handle created by `ac_new` or `ac_builder_build`.
+    #[no_mangle]
+    pub extern "C" fn ac_free(ac: *mut AC) {
+        if !ac.is_null() {
+            unsafe { drop(Box::from_raw(ac)) };
+        }
+    }
+
+    /// Return which Aho-Corasick implementation was chosen internally.
+    #[no_mangle]
+    pub extern "C" fn ac_kind(ac: *const AC) -> ACAutomatonKind {
+        if ac.is_null() {
+            return ACAutomatonKind::ContiguousNFA;
+        }
+        let k = unsafe { (&*ac).inner.kind() };
+        k.into()
+    }
+
+    /// Return the match kind used by this automaton.
+    #[no_mangle]
+    pub extern "C" fn ac_match_kind(ac: *const AC) -> ACMatchKind {
+        if ac.is_null() {
+            return ACMatchKind::Standard;
+        }
+        let k = unsafe { (&*ac).inner.match_kind() };
+        match k {
+            MatchKind::Standard => ACMatchKind::Standard,
+            MatchKind::LeftmostFirst => ACMatchKind::LeftmostFirst,
+            MatchKind::LeftmostLongest => ACMatchKind::LeftmostLongest,
+        }
+    }
+
+    /// Return the start kind supported by this automaton (as configured).
+    #[no_mangle]
+    pub extern "C" fn ac_start_kind(ac: *const AC) -> ACStartKind {
+        if ac.is_null() {
+            return ACStartKind::Unanchored;
+        }
+        let k = unsafe { (&*ac).inner.start_kind() };
+        match k {
+            StartKind::Unanchored => ACStartKind::Unanchored,
+            StartKind::Anchored => ACStartKind::Anchored,
+            StartKind::Both => ACStartKind::Both,
+        }
+    }
+
+    /// Return the number of patterns compiled into this automaton.
+    #[no_mangle]
+    pub extern "C" fn ac_patterns_len(ac: *const AC) -> usize {
+        if ac.is_null() {
+            return 0;
+        }
+        unsafe { (&*ac).inner.patterns_len() }
+    }
+
+    /// Return the minimum pattern length in this automaton.
+    #[no_mangle]
+    pub extern "C" fn ac_min_pattern_len(ac: *const AC) -> usize {
+        if ac.is_null() {
+            return 0;
+        }
+        unsafe { (&*ac).inner.min_pattern_len() }
+    }
+
+    /// Return the maximum pattern length in this automaton.
+    #[no_mangle]
+    pub extern "C" fn ac_max_pattern_len(ac: *const AC) -> usize {
+        if ac.is_null() {
+            return 0;
+        }
+        unsafe { (&*ac).inner.max_pattern_len() }
+    }
+
+    /// Return the approximate heap memory usage (bytes).
+    #[no_mangle]
+    pub extern "C" fn ac_memory_usage(ac: *const AC) -> usize {
+        if ac.is_null() {
+            return 0;
+        }
+        unsafe { (&*ac).inner.memory_usage() }
+    }
+
+    // ===================
+    // Searching
+    // ===================
+
+    /// Test whether any match exists in `haystack`.
+    ///
+    /// Writes true/false to `*out_found`. On configuration errors, returns
+    /// `AC_MATCH_ERROR` with a message.
+    #[no_mangle]
+    pub extern "C" fn ac_is_match(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        out_found: *mut bool,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null() || out_found.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            // earliest(true) for is_match with leftmost semantics.
+            match ac.inner.try_find(&Input::new(hay).earliest(true)) {
+                Ok(opt) => {
+                    unsafe { *out_found = opt.is_some() };
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(code) => code,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    /// Find the first match. If found, writes it to `*out_match` and sets
+    /// `*out_found = true`. Otherwise, `*out_found = false`.
+    ///
+    /// `earliest` can be set to true to return as soon as any match is known
+    /// to occur (useful with leftmost semantics). `anchored` selects whether
+    /// to run an anchored search.
+    #[no_mangle]
+    pub extern "C" fn ac_find(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        earliest: bool,
+        anchored: bool,
+        out_match: *mut ACMatch,
+        out_found: *mut bool,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null() || out_found.is_null() || out_match.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let input = Input::new(hay)
+                .earliest(earliest)
+                .anchored(if anchored { Anchored::Yes } else { Anchored::No });
+            match ac.inner.try_find(input) {
+                Ok(opt) => {
+                    if let Some(m) = opt {
+                        unsafe {
+                            *out_match = ACMatch::from(m);
+                            *out_found = true;
+                        }
+                    } else {
+                        unsafe { *out_found = false };
+                    }
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(code) => code,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    /// Find all non-overlapping matches and return them as an array of ACMatch.
+    /// The array must be freed with `ac_matches_free`.
+    #[no_mangle]
+    pub extern "C" fn ac_find_all(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        anchored: bool,
+        out_matches: *mut *mut ACMatch,
+        out_len: *mut usize,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null() || out_matches.is_null() || out_len.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let input =
+                Input::new(hay).anchored(if anchored { Anchored::Yes } else { Anchored::No });
+            match ac.inner.try_find_iter(input) {
+                Ok(mut it) => {
+                    let mut out = Vec::<ACMatch>::new();
+                    while let Some(m) = it.next() {
+                        out.push(ACMatch::from(m));
+                    }
+                    let len = out.len();
+                    let boxed = out.into_boxed_slice();
+                    let ptr = Box::into_raw(boxed) as *mut ACMatch;
+                    unsafe {
+                        *out_matches = ptr;
+                        *out_len = len;
+                    }
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(code) => code,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    // ===================
+    // New: Prefix and Suffix matching
+    // ===================
+
+    /// Prefix check: does any pattern match at the beginning of `haystack`?
+    ///
+    /// This runs an anchored search from the start (offset 0) and sets
+    /// `*out_found` accordingly. This respects the automaton's configured
+    /// match semantics:
+    /// - Standard: first match seen is returned
+    /// - LeftmostFirst: first by pattern priority
+    /// - LeftmostLongest: longest among those starting at 0
+    #[no_mangle]
+    pub extern "C" fn ac_is_prefix(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        out_found: *mut bool,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null() || out_found.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let input = Input::new(hay).anchored(Anchored::Yes).earliest(true);
+            match ac.inner.try_find(input) {
+                Ok(opt) => {
+                    unsafe { *out_found = opt.is_some() };
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(c) => c,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    /// Prefix match: if a match starts at 0, write it to `*out_match` and set `*out_found = true`.
+    #[no_mangle]
+    pub extern "C" fn ac_find_prefix(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        out_match: *mut ACMatch,
+        out_found: *mut bool,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null() || out_match.is_null() || out_found.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let input = Input::new(hay).anchored(Anchored::Yes);
+            match ac.inner.try_find(input) {
+                Ok(opt) => {
+                    if let Some(m) = opt {
+                        unsafe {
+                            *out_match = ACMatch::from(m);
+                            *out_found = true;
+                        }
+                    } else {
+                        unsafe { *out_found = false };
+                    }
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(c) => c,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    /// Helper used by suffix routines. Tries to find a match that ends at
+    /// `hay.len()`. Returns Ok(Some(m)) if found.
+    fn find_suffix_match(ac: &AhoCorasick, hay: &[u8]) -> Result<Option<Match>, MatchError> {
+        let n = hay.len();
+        let min_len = ac.min_pattern_len();
+        let max_len = ac.max_pattern_len();
+
+        if min_len > n {
+            return Ok(None);
+        }
+        // Candidate start positions: any start s such that some pattern length L
+        // satisfies s + L == n, i.e., s in [n - max_len, n - min_len].
+        let start_lo = n.saturating_sub(max_len);
+        let start_hi = n - min_len;
+
+        match ac.match_kind() {
+            MatchKind::Standard => {
+                // Enumerate anchored overlapping matches at each start position
+                // to see if any ends at the haystack end. Iterate from earliest
+                // start to favor the longest suffix.
+                for s in start_lo..=start_hi {
+                    let mut state = OverlappingState::start();
+                    let input = Input::new(hay).range(s..).anchored(Anchored::Yes);
+                    loop {
+                        ac.try_find_overlapping(input.clone(), &mut state)?;
+                        match state.get_match() {
+                            Some(m) => {
+                                if m.end() == n {
+                                    return Ok(Some(m));
+                                } else {
+                                    // Keep enumerating other matches at this start position.
+                                    continue;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            // For leftmost-first/longest, we cannot enumerate overlapping matches.
+            // Rely on anchored `find` at each start position. With LeftmostLongest this
+            // chooses the longest match starting at `s`. With LeftmostFirst it chooses by
+            // pattern priority. We accept it and filter by those ending at `n`.
+            MatchKind::LeftmostFirst | MatchKind::LeftmostLongest => {
+                for s in start_lo..=start_hi {
+                    let input = Input::new(hay).range(s..).anchored(Anchored::Yes);
+                    if let Some(m) = ac.try_find(input)? {
+                        if m.end() == n {
+                            return Ok(Some(m));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Suffix check: does any pattern match and end at the end of `haystack`?
+    ///
+    /// Notes:
+    /// - Works for all match kinds.
+    /// - With MatchKind::Standard, we enumerate overlapping matches anchored at
+    ///   candidate starts near the end to ensure we can detect longer suffixes.
+    /// - With LeftmostLongest, this naturally finds the longest suffix.
+    /// - With LeftmostFirst, suffix existence depends on pattern priority when
+    ///   multiple matches start at the same position.
+    #[no_mangle]
+    pub extern "C" fn ac_is_suffix(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        out_found: *mut bool,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null() || out_found.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            match find_suffix_match(&ac.inner, hay) {
+                Ok(opt) => {
+                    unsafe { *out_found = opt.is_some() };
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(c) => c,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    /// Suffix match: if a match ends at the end of `haystack`, write it to `*out_match`.
+    ///
+    /// Preference:
+    /// - When MatchKind::Standard, returns the longest suffix (by iterating candidate
+    ///   start positions from earlier to later and enumerating overlapping matches).
+    /// - When MatchKind::LeftmostLongest, returns the longest suffix.
+    /// - When MatchKind::LeftmostFirst, returns the suffix chosen by pattern priority
+    ///   at its start position (if any).
+    #[no_mangle]
+    pub extern "C" fn ac_find_suffix(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        out_match: *mut ACMatch,
+        out_found: *mut bool,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null() || out_match.is_null() || out_found.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            match find_suffix_match(&ac.inner, hay) {
+                Ok(opt) => {
+                    if let Some(m) = opt {
+                        unsafe {
+                            *out_match = ACMatch::from(m);
+                            *out_found = true;
+                        }
+                    } else {
+                        unsafe { *out_found = false };
+                    }
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(c) => c,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    // ===================
+    // Overlapping search (step-wise)
+    // ===================
+
+    /// Create a new overlapping state object.
+    #[no_mangle]
+    pub extern "C" fn ac_overlapping_state_create() -> *mut ACOverlappingState {
+        Box::into_raw(Box::new(ACOverlappingState { inner: OverlappingState::start() }))
+    }
+
+    /// Reset an overlapping state to its initial value.
+    #[no_mangle]
+    pub extern "C" fn ac_overlapping_state_reset(state: *mut ACOverlappingState) {
+        if state.is_null() {
+            return;
+        }
+        let s = unsafe { &mut *state };
+        s.inner = OverlappingState::start();
+    }
+
+    /// Free an overlapping state object.
+    #[no_mangle]
+    pub extern "C" fn ac_overlapping_state_free(state: *mut ACOverlappingState) {
+        if !state.is_null() {
+            unsafe { drop(Box::from_raw(state)) };
+        }
+    }
+
+    /// Perform one step of overlapping search. On success, sets `*out_found`
+    /// to true and writes the match to `*out_match` if a match is available.
+    /// Otherwise, sets `*out_found = false`.
+    ///
+    /// Only supported when the automaton uses Standard semantics.
+    #[no_mangle]
+    pub extern "C" fn ac_find_overlapping_step(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut ACOverlappingState,
+        out_match: *mut ACMatch,
+        out_found: *mut bool,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null()
+                || state.is_null()
+                || out_match.is_null()
+                || out_found.is_null()
+            {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let s = unsafe { &mut *state };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            match ac.inner.try_find_overlapping(hay, &mut s.inner) {
+                Ok(()) => {
+                    let opt = s.inner.get_match();
+                    if let Some(m) = opt {
+                        unsafe {
+                            *out_match = ACMatch::from(m);
+                            *out_found = true;
+                        }
+                    } else {
+                        unsafe { *out_found = false };
+                    }
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(code) => code,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    // ===================
+    // Replacement
+    // ===================
+
+    /// Replace all matches with the corresponding replacement at the same index.
+    /// The replacements array length must equal `ac_patterns_len(ac)`.
+    /// On success, writes an owned buffer to `*out_ptr` and length to `*out_len`.
+    /// Free the buffer with `ac_buf_free`.
+    #[no_mangle]
+    pub extern "C" fn ac_replace_all_bytes(
+        ac: *const AC,
+        haystack: *const u8,
+        haystack_len: usize,
+        replacements: *const *const u8,
+        repl_lens: *const usize,
+        replacements_len: usize,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+        err_msg: *mut *mut c_char,
+        err_len: *mut usize,
+    ) -> ACResult {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if ac.is_null() || out_ptr.is_null() || out_len.is_null() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            let ac = unsafe { &*ac };
+            let hay = unsafe { read_slice(haystack, haystack_len)? };
+            let repls = unsafe { read_slices(replacements, repl_lens, replacements_len)? };
+            if repls.len() != ac.inner.patterns_len() {
+                return ACResult::AC_INVALID_ARGUMENT;
+            }
+            match ac.inner.try_replace_all_bytes(hay, &repls) {
+                Ok(bytes) => {
+                    let len = bytes.len();
+                    let boxed = bytes.into_boxed_slice();
+                    let ptr = Box::into_raw(boxed) as *mut u8;
+                    unsafe {
+                        *out_ptr = ptr;
+                        *out_len = len;
+                    }
+                    ACResult::AC_OK
+                }
+                Err(e) => map_match_err(e, err_msg, err_len),
+            }
+        }));
+        match result {
+            Ok(code) => code,
+            Err(_) => ACResult::AC_PANIC,
+        }
+    }
+
+    // ===================
+    // Free functions for owned buffers
+    // ===================
+
+    /// Free a buffer returned by this API (e.g., from `ac_replace_all_bytes`).
+    #[no_mangle]
+    pub extern "C" fn ac_buf_free(ptr: *mut u8, len: usize) {
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(slice::from_raw_parts_mut(ptr, len));
+        }
+    }
+
+    /// Free an error/message buffer returned by this API.
+    #[no_mangle]
+    pub extern "C" fn ac_str_free(ptr: *mut c_char, len: usize) {
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(slice::from_raw_parts_mut(ptr as *mut u8, len));
+        }
+    }
+
+    /// Free a match array returned by this API.
+    #[no_mangle]
+    pub extern "C" fn ac_matches_free(ptr: *mut ACMatch, len: usize) {
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(slice::from_raw_parts_mut(ptr, len));
+        }
     }
 }
