@@ -439,17 +439,17 @@ pub mod ffi {
         }
     }
 
-    #[repr(C)]
+    
     pub struct AC {
         inner: AhoCorasick,
     }
 
-    #[repr(C)]
+    
     pub struct ACBuilder {
         inner: AhoCorasickBuilder,
     }
 
-    #[repr(C)]
+    
     pub struct ACOverlappingState {
         inner: OverlappingState,
     }

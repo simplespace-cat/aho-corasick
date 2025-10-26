@@ -6,23 +6,31 @@ documentation = true
 usize_is_size_t = true
 sys_includes = ["stddef.h", "stdint.h", "stdbool.h"]
 
+# C typedef-style for enums/structs/unions
+style = "type"  # valid: "both" | "tag" | "type"
+
 [export]
-# Only export the C API items.
 include = ["ffi"]
 
 [defines]
-# You can set feature-dependent defines here if needed.
 # "std" = "AHOCORASICK_HAVE_STD"
 
 [macro_expansion]
 bitflags = true
 
-[style]
-# Prefer C-style enums in the header.
+[enum]
+# only meaningful for C++; harmless here
 enum_class = false
 
 [parse]
-expand = true
+parse_deps = false
 clean = true
+# include = []
+# exclude = []
+# extra_bindings = []
 
-[defines]
+[parse.expand]
+crates = []
+all_features = false
+default_features = true
+features = []

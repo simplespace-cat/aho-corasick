@@ -11,3 +11,4 @@ BREADCRUMBS
 /tmp
 /aho-corasick-debug/Cargo.lock
 *.a
+/exe
