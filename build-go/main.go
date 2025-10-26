@@ -20,6 +20,14 @@ const (
 func main() {
 	log.SetFlags(0)
 
+	// Parse flags: --real -> also build real-test (do not run)
+	buildReal := false
+	for _, arg := range os.Args[1:] {
+		if arg == "--real" || arg == "-real" || arg == "real" {
+			buildReal = true
+		}
+	}
+
 	// Check required tools.
 	mustHave("cargo")
 	mustHave("cbindgen")
@@ -69,21 +77,26 @@ func main() {
 	}
 	say("Smoke test PASSED.")
 
-	// Build the real-test tool (CoreFoundation needed). Do not auto-run by default.
-	realSrc := realTestPath()
-	realOut := filepath.Join(exeDir, "real-test")
-	_ = os.Remove(realOut)
-	say("Compiling real-test (%s) -> %s...", realSrc, realOut)
-	must(run(
-		"clang",
-		"-std=c23",
-		"-arch", "arm64",
-		"-I", include,
-		realSrc,
-		dstLib,
-		"-framework", "CoreFoundation",
-		"-o", realOut,
-	))
+	// Optionally build the real-test tool (CoreFoundation needed). Do not auto-run.
+	if buildReal {
+		realSrc := realTestPath()
+		realOut := filepath.Join(exeDir, "real-test")
+		_ = os.Remove(realOut)
+		say("Compiling real-test (%s) -> %s...", realSrc, realOut)
+		must(run(
+			"clang",
+			"-std=c23",
+			"-arch", "arm64",
+			"-I", include,
+			realSrc,
+			dstLib,
+			"-framework", "CoreFoundation",
+			"-o", realOut,
+		))
+		say("real-test built at %s (not auto-run).", realOut)
+	} else {
+		say("Skipping real-test build (pass --real to enable).")
+	}
 
 	say("Done.")
 	fmt.Printf("Header: %s\n", headerOut)
@@ -165,11 +178,11 @@ func smokePath() string {
 
 // realTestPath returns the existing real test source path.
 func realTestPath() string {
-	p1 := filepath.Join("smoke", "real-test.c")
+	p1 := filepath.Join("smoke-test", "real-test.c")
 	if _, err := os.Stat(p1); err == nil {
 		return p1
 	}
-	p2 := filepath.Join("smoke-test", "real-test.c")
+	p2 := filepath.Join("smoke", "real-test.c")
 	if _, err := os.Stat(p2); err == nil {
 		return p2
 	}
