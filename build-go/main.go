@@ -40,7 +40,7 @@ func main() {
 
 	// Build static library for macOS arm64.
 	say("Building Rust static library (release, %s)...", target)
-	must(run("cargo", "build", "--release", "--target", target))
+	must(runCargoBuild())
 
 	// Copy lib into include/.
 	srcLib := filepath.Join("target", target, "release", libName)
@@ -119,6 +119,21 @@ func mustHave(tool string) {
 
 func run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func runCargoBuild() error {
+	pwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get working directory: %w", err)
+	}
+
+	cmd := exec.Command("cargo", "build", "--release", "--target", target)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("RUSTFLAGS=-A non_snake_case -A non_upper_case_globals -A non_camel_case_types --remap-path-prefix=%s=/", pwd),
+	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
